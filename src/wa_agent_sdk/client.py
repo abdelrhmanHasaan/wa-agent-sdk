@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import logging
+import re
 import signal
 from datetime import datetime
 from pathlib import Path
@@ -34,6 +35,17 @@ from .tools.documents import format_document_block, parse_document
 from .tools.media import detect_image_mime, prepare_image
 
 log = logging.getLogger("wa_agent")
+
+# Some providers (notably NVIDIA NIM) force tool-mode server-side and answer
+# ordinary chat with meta-narration instead of content. When we see that, we
+# simply retry the same conversation without the tools array.
+_DEGENERATE_TOOL_RE = re.compile(
+    r"\bno function call\b"
+    r"|\bno functions?\s+(?:is|are)\s+needed\b"
+    r"|\b(?:do(?:es)?\s+not|don'?t)\s+need\s+to\s+(?:call|use)\s+(?:any\s+)?functions?\b"
+    r"|\bcannot\s+call\s+any\s+functions?\b",
+    re.IGNORECASE,
+)
 
 MessageHook = Callable[[IncomingMessage], Awaitable[Any]]
 ReadyHook = Callable[[], Awaitable[None]]
@@ -731,7 +743,7 @@ class WhatsAppAgent:
             effective_schemas = schemas if supports_tools else None
 
             async def do_chat(messages, tools_list):
-                return await provider.chat(messages, tools=effective_schemas)
+                return await provider.chat(messages, tools=tools_list)
 
         conversation = [
             ChatMessage(role="system", content=self._system_prompt(
@@ -743,6 +755,15 @@ class WhatsAppAgent:
         result_text = ""
         for _iteration in range(max(1, self.config.max_tool_iterations)):
             result = await do_chat(conversation, effective_schemas)
+
+            if not result.has_tool_calls and effective_schemas \
+                    and _DEGENERATE_TOOL_RE.search(result.text or ""):
+                log.warning(
+                    "Provider narrated about tools instead of answering; "
+                    "retrying the same turn without tools"
+                )
+                result = await do_chat(conversation, None)
+
             if not result.has_tool_calls:
                 result_text = result.text
                 break

@@ -596,4 +596,5 @@ import logging; logging.basicConfig(level=logging.INFO)   # DEBUG for the chatty
 | Want a totally fresh start | delete `.wa_sessions/<name>/` and restart |
 | `ProviderAuthError` | export the env var named in the error, or pass `api_key=` |
 | Images ignored | your model isn't vision-capable — switch models |
+| Bot replies *"No function call is needed…"* | provider (NVIDIA NIM) over-applies tool mode — SDK auto-retries without tools; or set `enable_builtin_tools=False` |
 | Bridge crash details | tail `.wa_sessions/logs/bridge-*.log` |

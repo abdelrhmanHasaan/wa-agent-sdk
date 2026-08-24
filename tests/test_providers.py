@@ -116,6 +116,40 @@ def test_gemini_function_response_shape():
     assert (res.input_tokens, res.output_tokens) == (13, 8)
 
 
+def test_degenerate_tool_narration_retries_without_tools():
+    calls = []
+
+    class Degenerate(OpenAICompatibleProvider):
+        async def chat(self, messages, tools=None):
+            calls.append(tools is not None)
+            if tools is not None:
+                return ChatResult(text="No function call is needed for this prompt.")
+            return ChatResult(text="Hello there! 👋")
+
+    agent = WhatsAppAgent(llm=LLMConfig(provider="openai", model="m", api_key="k"))
+    agent._provider = Degenerate(LLMConfig(provider="openai", model="m", api_key="k"))
+    agent.memory.append("c1", ChatMessage(role="user", content="just say hi"))
+
+    reply = asyncio.run(agent._generate("c1"))
+    assert reply == "Hello there! 👋"
+    assert calls == [True, False]  # first WITH tools, retry WITHOUT
+
+
+def test_normal_reply_keeps_tools_single_call():
+    calls = []
+
+    class Normal(OpenAICompatibleProvider):
+        async def chat(self, messages, tools=None):
+            calls.append(tools is not None)
+            return ChatResult(text="hi!")
+
+    agent = WhatsAppAgent(llm=LLMConfig(provider="openai", model="m", api_key="k"))
+    agent._provider = Normal(LLMConfig(provider="openai", model="m", api_key="k"))
+    agent.memory.append("c1", ChatMessage(role="user", content="hello"))
+    asyncio.run(agent._generate("c1"))
+    assert calls == [True]  # no pointless second call
+
+
 def test_agent_tool_loop_executes_builtin_calculator():
     class ScriptedProvider(OpenAICompatibleProvider):
         def __init__(self):
