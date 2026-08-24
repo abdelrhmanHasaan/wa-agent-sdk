@@ -158,7 +158,7 @@ function normalize(raw) {
 
   return {
     id: raw.key.id || "",
-    jid,
+    chat_jid: jid,
     sender_jid: raw.key.participant || jid,
     push_name: raw.pushName || null,
     from_me: !!raw.key.fromMe,

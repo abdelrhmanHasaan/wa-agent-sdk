@@ -5,7 +5,7 @@ from __future__ import annotations
 import time
 from enum import Enum
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field
 
 
 def _now() -> float:
@@ -27,10 +27,10 @@ class MediaType(str, Enum):
 class IncomingMessage(BaseModel):
     """A normalized WhatsApp message received from the bridge."""
 
-    model_config = ConfigDict(extra="ignore")
+    model_config = ConfigDict(extra="ignore", populate_by_name=True)
 
     id: str
-    chat_jid: str
+    chat_jid: str = Field(validation_alias=AliasChoices("chat_jid", "jid"))
     sender_jid: str
     push_name: str | None = None
     from_me: bool = False
