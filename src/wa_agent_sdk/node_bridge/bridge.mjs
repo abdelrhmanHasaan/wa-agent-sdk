@@ -40,14 +40,39 @@ function emit(type, payload = {}) {
 
 async function loadBaileys() {
   const mod = await import("@whiskeysockets/baileys");
-  const m = mod.default ?? mod;
-  const makeWASocket = m.default ?? m;
+
+  const merged = {};
+  const sources = [];
+  if (mod && (typeof mod === "object" || typeof mod === "function")) sources.push(mod);
+  if (mod?.default && typeof mod.default === "object") sources.push(mod.default);
+  if (typeof mod?.default === "function") sources.push({ makeWASocket: mod.default });
+  for (const src of sources) {
+    let keys = [];
+    try { keys = Object.keys(src); } catch { continue; }
+    for (const key of keys) {
+      if (merged[key] === undefined) {
+        try { merged[key] = src[key]; } catch { /* getter threw */ }
+      }
+    }
+  }
+
+  const makeWASocket = merged.makeWASocket ?? merged.default;
+  const required = ["useMultiFileAuthState", "fetchLatestBaileysVersion", "downloadMediaMessage"];
+  if (typeof makeWASocket !== "function") {
+    throw new Error("baileys: makeWASocket export not found");
+  }
+  for (const name of required) {
+    if (typeof merged[name] !== "function") {
+      throw new Error(`baileys: required export '${name}' not found`);
+    }
+  }
+
   return {
     makeWASocket,
-    useMultiFileAuthState: m.useMultiFileAuthState,
-    fetchLatestBaileysVersion: m.fetchLatestBaileysVersion,
-    DisconnectReason: m.DisconnectReason ?? {},
-    downloadMediaMessage: m.downloadMediaMessage,
+    useMultiFileAuthState: merged.useMultiFileAuthState,
+    fetchLatestBaileysVersion: merged.fetchLatestBaileysVersion,
+    DisconnectReason: merged.DisconnectReason ?? {},
+    downloadMediaMessage: merged.downloadMediaMessage,
   };
 }
 
@@ -355,13 +380,16 @@ wss.on("connection", (ws, req) => {
   try {
     wa = await loadBaileys();
   } catch (err) {
-    emit("fatal", { error: `failed_to_load_baileys: ${String(err?.message || err)}` });
+    const msg = `failed_to_load_baileys: ${String(err?.message || err)}`;
+    logger.error({ err: String(err?.stack || err) }, "baileys load failed");
+    emit("fatal", { error: msg });
     setTimeout(() => process.exit(1), 300);
     return;
   }
   try {
     await startWhatsApp();
   } catch (err) {
+    logger.error({ err: String(err?.stack || err) }, "startWhatsApp failed");
     emit("fatal", { error: String(err?.stack || err) });
   }
 })();
