@@ -167,6 +167,9 @@ class ToolRegistry:
     def get(self, name: str) -> Tool | None:
         return self._tools.get(name)
 
+    def items(self) -> list[Tool]:
+        return list(self._tools.values())
+
     def schemas(self) -> list[dict[str, Any]]:
         return [
             {"name": t.name, "description": t.description, "parameters": t.parameters}

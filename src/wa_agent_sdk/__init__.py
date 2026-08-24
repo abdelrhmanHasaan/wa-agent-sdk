@@ -31,6 +31,9 @@ from .llm.base import BaseChatProvider, ChatMessage, ChatResult, ToolCall, image
 from .llm.factory import create_provider, register_provider
 from .memory import ConversationMemory
 from .models import IncomingMessage, MediaType, SentReceipt
+from .router import AgentRouter, Route, TriggerBoard
+from .safety import SafetyManager
+from .scheduler import CampaignReport, Job, Scheduler
 from .tools import Tool, ToolRegistry, parse_document, prepare_image, tool
 
 __all__ = [
@@ -56,6 +59,13 @@ __all__ = [
     "tool",
     "parse_document",
     "prepare_image",
+    "AgentRouter",
+    "Route",
+    "TriggerBoard",
+    "SafetyManager",
+    "Scheduler",
+    "Job",
+    "CampaignReport",
     "WaAgentError",
     "BridgeError",
     "ProviderError",

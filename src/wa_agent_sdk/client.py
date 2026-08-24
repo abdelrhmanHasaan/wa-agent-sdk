@@ -25,7 +25,9 @@ from .llm.factory import create_provider
 from .memory import ConversationMemory
 from .models import IncomingMessage, MediaType, SentReceipt, jid_to_number
 from .qr import print_pairing_qr
+from .router import AgentRouter, TriggerBoard
 from .safety import SafetyManager
+from .scheduler import CampaignReport, Scheduler
 from .tools.base import Tool, ToolRegistry, tool_from_callable
 from .tools.builtin import create_builtin_tools
 from .tools.documents import format_document_block, parse_document
@@ -102,7 +104,11 @@ class WhatsAppAgent:
             humanize_min_delay=config.humanize_min_delay,
             humanize_max_delay=config.humanize_max_delay,
         )
+        self.router = AgentRouter()
+        self.triggers = TriggerBoard()
+        self.scheduler = Scheduler(self.send_text)
         self._provider: BaseChatProvider | None = None
+        self._extra_providers: dict[str, BaseChatProvider] = {}
         self._bridge: BaileysBridge | None = None
         self._ready = asyncio.Event()
         self._stop_event = asyncio.Event()
@@ -143,6 +149,26 @@ class WhatsAppAgent:
         self.tools.register(resolved)
         return resolved
 
+    def add_trigger(
+        self,
+        pattern: str | Any,
+        reply: Any,
+        *,
+        exact: bool = False,
+        priority: int = 0,
+    ) -> None:
+        """Instant rule-based reply (no LLM cost).
+
+        ``pattern`` is a substring (case-insensitive), compiled regex, or an
+        exact word when ``exact=True``. ``reply`` may be a static string or a
+        (possibly async) callable receiving the message.
+        """
+        self.triggers.add(pattern, reply, exact=exact, priority=priority)
+
+    def add_route(self, name: str, match: Any = None, **kwargs: Any) -> Any:
+        """Register an agent persona; see :mod:`wa_agent_sdk.router`."""
+        return self.router.add_route(name, match, **kwargs)
+
     # -------------------------------------------------------------- lifecycle
 
     @property
@@ -182,13 +208,18 @@ class WhatsAppAgent:
 
     async def stop(self) -> None:
         self._stop_event.set()
+        cancelled_jobs = self.scheduler.cancel_all()
+        if cancelled_jobs:
+            log.info("Cancelled %d scheduled job(s)", cancelled_jobs)
         for task in list(self._background_tasks):
             task.cancel()
         self._background_tasks.clear()
         if self._bridge is not None:
             await self._bridge.stop()
-        if self._provider is not None:
-            await self._provider.aclose()
+        for provider in [self._provider, *self._extra_providers.values()]:
+            if provider is not None:
+                await provider.aclose()
+        self._extra_providers.clear()
         self._ready.clear()
 
     async def __aenter__(self) -> "WhatsAppAgent":
@@ -279,6 +310,46 @@ class WhatsAppAgent:
             receipts.append(await self.send_text(jid, text))
             await asyncio.sleep(0.6)
         return receipts
+
+    async def send_campaign(
+        self,
+        jids: list[str],
+        text: str | Callable[[str], str],
+        *,
+        min_delay: float | None = None,
+        max_delay: float | None = None,
+        skip_opted_out: bool = True,
+    ) -> dict[str, int]:
+        """Human-paced bulk messaging with opt-out compliance.
+
+        Delays are randomized between ``min_delay`` and ``max_delay`` seconds
+        (defaults from AgentConfig: 6–15s). Opted-out numbers are skipped.
+        """
+        import random
+
+        cfg = self.config
+        lo = max(0.05, min_delay if min_delay is not None else cfg.campaign_min_delay)
+        hi = max(lo, max_delay if max_delay is not None else cfg.campaign_max_delay)
+        report = CampaignReport()
+
+        total = len(jids)
+        for index, jid in enumerate(jids, start=1):
+            if skip_opted_out and self.safety.is_blocked(jid):
+                report.skipped_opted_out += 1
+                continue
+            payload = text(jid) if callable(text) else text
+            try:
+                await self.send_text(jid, payload)
+                report.sent += 1
+            except WaAgentError as exc:
+                log.warning("Campaign send to %s failed: %s", jid, exc)
+                report.failed += 1
+            self.safety.record_outbound(jid)
+            log.info("Campaign progress %d/%d (sent=%d skipped=%d failed=%d)",
+                     index, total, report.sent, report.skipped_opted_out, report.failed)
+            if index < total:
+                await asyncio.sleep(random.uniform(lo, hi))
+        return report.as_dict()
 
     async def _send_media(self, *args: Any, **kwargs: Any) -> SentReceipt:
         if self._bridge is None:
@@ -394,6 +465,13 @@ class WhatsAppAgent:
             except WaAgentError:
                 pass
 
+        trigger_reply = await self.triggers.match(message)
+        if trigger_reply is not None:
+            if trigger_reply.strip():
+                await self.safety.pause_before_send()
+                await self.send_text(message.chat_jid, trigger_reply)
+            return
+
         if self._message_hook is not None:
             try:
                 hook_reply = await self._message_hook(message)
@@ -405,8 +483,11 @@ class WhatsAppAgent:
                 await self.send_text(message.chat_jid, hook_reply)
                 return
 
+        route = self.router.resolve(message)
         try:
-            user_msg = await self._build_user_message(message)
+            user_msg = await self._build_user_message(message, provider=self._provider_for(
+                route.llm if route and route.llm else self.config.llm
+            ))
         except (MediaError, UnsupportedDocumentError) as exc:
             await self.send_text(message.chat_jid, f"⚠️ Could not process your attachment: {exc}")
             return
@@ -423,7 +504,7 @@ class WhatsAppAgent:
         if cfg.typing_indicator:
             await self.send_typing(message.chat_jid, True)
         try:
-            reply_text = await self._generate(message.chat_jid)
+            reply_text = await self._generate(message.chat_jid, route=route)
         except ProviderError as exc:
             log.error("LLM provider error: %s", exc)
             reply_text = f"⚠️ My AI backend had a problem: {str(exc)[:300]}"
@@ -439,15 +520,17 @@ class WhatsAppAgent:
             await self.safety.pause_before_send()
             await self.send_text(message.chat_jid, reply_text)
 
-    async def _build_user_message(self, message: IncomingMessage) -> ChatMessage | None:
+    async def _build_user_message(
+        self, message: IncomingMessage, *, provider: BaseChatProvider | None = None
+    ) -> ChatMessage | None:
         cfg = self.config
         blocks: list[dict[str, Any]] = []
         caption = (message.caption or "").strip()
         body = (message.text or "").strip()
 
         if message.has_media and message.media_type == MediaType.IMAGE:
-            if cfg.handle_images and self._bridge is not None and self._provider is not None \
-                    and getattr(self._provider, "supports_vision", True):
+            if cfg.handle_images and self._bridge is not None and provider is not None \
+                    and getattr(provider, "supports_vision", True):
                 raw_b64, _mime = await self._bridge.download_media(message.id)
                 img_b64, img_mime = prepare_image(base64.b64decode(raw_b64), max_side=cfg.max_image_side_px)
                 blocks.append(image_block(img_mime, img_b64))
@@ -494,10 +577,10 @@ class WhatsAppAgent:
         }
         return mapping.get(message.media_type, message.text)
 
-    def _system_prompt(self) -> str:
+    def _system_prompt(self, base: str | None = None) -> str:
         today = datetime.now().strftime("%A, %d %B %Y (%H:%M local)")
         extras = [
-            self.config.system_prompt,
+            base if base is not None else self.config.system_prompt,
             "",
             f"Current date/time: {today}.",
             "You are chatting over WhatsApp. Keep replies short and conversational.",
@@ -509,21 +592,42 @@ class WhatsAppAgent:
             extras.append(f"You can call these tools when useful: {names}.")
         return "\n".join(extras)
 
-    async def _generate(self, chat_jid: str) -> str:
-        provider = self._provider
-        if provider is None:
-            raise WaAgentError("Provider not initialised")
+    def _provider_for(self, llm: LLMConfig) -> BaseChatProvider:
+        """Provider cache — one HTTP client per (provider, model) combo."""
+        if llm is self.config.llm:
+            if self._provider is None:
+                self._provider = create_provider(llm)
+            return self._provider
+        key = f"{llm.provider}:{llm.model}:{llm.resolved_base_url}"
+        if key not in self._extra_providers:
+            self._extra_providers[key] = create_provider(llm)
+        return self._extra_providers[key]
 
-        supports_tools = bool(len(self.tools)) and getattr(provider, "supports_tools", True)
-        schemas = self.tools.schemas() if supports_tools else None
+    def _tools_for(self, route: Any) -> tuple[ToolRegistry, list[dict[str, Any]]]:
+        if not route or not route.tools:
+            return self.tools, self.tools.schemas()
+        merged = ToolRegistry()
+        for t in self.tools.items():
+            merged.register(t)
+        for t in route.tools:
+            merged.register(t)
+        return merged, merged.schemas()
+
+    async def _generate(self, chat_jid: str, route: Any = None) -> str:
+        provider = self._provider_for(route.llm if route and route.llm else self.config.llm)
+
+        registry, schemas = self._tools_for(route)
+        supports_tools = bool(len(registry)) and getattr(provider, "supports_tools", True)
         conversation = [
-            ChatMessage(role="system", content=self._system_prompt()),
+            ChatMessage(role="system", content=self._system_prompt(
+                route.system_prompt if route else None
+            )),
             *self.memory.history(chat_jid),
         ]
 
         result_text = ""
         for _iteration in range(max(1, self.config.max_tool_iterations)):
-            result = await provider.chat(conversation, tools=schemas)
+            result = await provider.chat(conversation, tools=schemas if supports_tools else None)
             if not result.has_tool_calls:
                 result_text = result.text
                 break
@@ -532,7 +636,7 @@ class WhatsAppAgent:
                 ChatMessage(role="assistant", content=result.text or None, tool_calls=result.tool_calls)
             )
             for call in result.tool_calls:
-                tool_obj = self.tools.get(call.name)
+                tool_obj = registry.get(call.name)
                 if tool_obj is None:
                     output = f"Error: unknown tool '{call.name}'"
                 else:
