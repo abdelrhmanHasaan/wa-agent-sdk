@@ -81,6 +81,9 @@ class WhatsAppAgent:
         self._setup(config)
 
     def _setup(self, config: AgentConfig) -> None:
+        from ._console import force_utf8_stdio
+
+        force_utf8_stdio()
         self.config = config
         self.tools = ToolRegistry()
         if config.enable_builtin_tools:

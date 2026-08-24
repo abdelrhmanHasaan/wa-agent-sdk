@@ -148,6 +148,7 @@ class BaileysBridge:
             WA_BRIDGE_TOKEN=self._token,
             WA_AUTH_DIR=str(self.auth_dir),
             WA_LOG_LEVEL="error",
+            WA_PARENT_PID=str(os.getpid()),
             FORCE_COLOR="0",
         )
 
@@ -160,6 +161,7 @@ class BaileysBridge:
             str(self._bridge_dir / "bridge.mjs"),
             cwd=str(self._bridge_dir),
             env=env,
+            stdin=asyncio.subprocess.PIPE,
             stdout=self._log_fh,
             stderr=subprocess.STDOUT,
             creationflags=flags,
@@ -377,6 +379,11 @@ class BaileysBridge:
                 pass
         proc, self._proc = self._proc, None
         if proc is not None and proc.returncode is None:
+            try:
+                if proc.stdin is not None:
+                    proc.stdin.close()
+            except Exception:  # noqa: BLE001
+                pass
             try:
                 proc.terminate()
             except ProcessLookupError:

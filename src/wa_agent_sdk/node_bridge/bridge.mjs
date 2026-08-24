@@ -12,6 +12,31 @@ const logger = pino({ level: LOG_LEVEL });
 const silent = pino({ level: "silent" });
 fs.mkdirSync(AUTH_DIR, { recursive: true });
 
+// Die together with the Python parent: if the parent is killed (even -9),
+// the OS closes our stdin pipe and we exit instead of becoming an orphan
+// that holds the WhatsApp stream hostage ("Stream Errored (conflict)" 440).
+try {
+  process.stdin.resume();
+  process.stdin.on("close", () => process.exit(0));
+  process.stdin.on("end", () => process.exit(0));
+} catch {
+  /* interactive stdin without pipe — nothing to tether to */
+}
+
+// Belt-and-braces: poll the parent PID directly (works even where pipe EOF
+// detection is flaky, e.g. some Windows configurations).
+const PARENT_PID = Number(process.env.WA_PARENT_PID || 0);
+if (PARENT_PID > 0) {
+  setInterval(() => {
+    try {
+      process.kill(PARENT_PID, 0);
+    } catch {
+      logger.error(`parent pid ${PARENT_PID} gone — exiting`);
+      process.exit(0);
+    }
+  }, 5000).unref();
+}
+
 const MEDIA_CACHE_LIMIT = 200;
 const mediaCache = new Map();
 
