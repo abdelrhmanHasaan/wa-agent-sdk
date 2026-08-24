@@ -15,6 +15,7 @@ provider + model + api key  →  scan QR  →  agent answers your WhatsApp
 | 🖼️ Images | Routed to vision models (GPT-4o, Claude, Gemini, Llama-vision…) |
 | 🧰 Tools | Function calling with automatic JSON-schema generation |
 | 🧠 Provider Router | Multiple APIs? Smart routing by complexity, cost, budgets, failover |
+| 💬 Human batching | Message bursts merge into ONE considered reply; new messages interrupt stale generations |
 | 🛡️ Anti-ban | Rate limits, cooldowns, quiet hours, STOP compliance, humanized pacing |
 | 🔀 Multi-agent | Route chats to different personas/models/tools on one number |
 | ⚡ Triggers | Instant keyword replies with zero LLM cost |
@@ -37,6 +38,7 @@ provider + model + api key  →  scan QR  →  agent answers your WhatsApp
 5. [Linking your number (QR)](#linking-your-number-qr)
 6. [Providers](#providers)
    - [Smart Provider Router (multi-API)](#smart-provider-router-multi-api)
+   - [Human-like batching](#human-like-batching)
 7. [Configuration reference](#configuration-reference)
 8. [🛡️ Anti-ban protection](#️-anti-ban-protection-stay-unbanned)
 9. [Use-case guides](#use-case-guides)
@@ -226,6 +228,34 @@ Notes:
   bypass the router entirely — a route that *must* use Claude still can.
 - The agent-level `llm=` remains the fallback used when no router is attached.
 
+### Human-like batching
+
+Real people don't answer each text the instant it lands. When a friend sends
+
+```
+hey
+did you see the match?
+CALL ME
+```
+
+the agent no longer fires off three separate replies. It waits for the burst
+to settle, then answers **everything in one considered response**.
+
+- **Debounce window** (`batch_window_seconds`, default 6 s): every new message
+  restarts the timer; the reply only goes out after the user goes quiet.
+- **Hard cap** (`batch_max_wait_seconds`, default 30 s): even a continuous
+  trickle gets answered — messages already queued are never lost, follow-ups
+  arrive as their own batch.
+- **Interruption**: if the model is mid-generation when another message
+  arrives, that generation is cancelled and its unanswered messages are
+  re-queued in front, so the eventual reply accounts for the entire burst.
+- The merged turn is presented to the model as *"You sent N messages in a
+  row, in this order: …"* so it naturally responds to all points at once.
+- Opt-out keywords, triggers, hooks and safety gates stay **instant** —
+  batching only applies to AI-generated replies.
+- Disable entirely with `human_batching=False` (old one-reply-per-message
+  behaviour).
+
 ## Configuration reference
 
 ```python
@@ -244,6 +274,9 @@ WhatsAppAgent(llm=..., **overrides)   # overrides = AgentConfig fields
 | `ignore_groups` | `True` | never respond inside group chats |
 | `allowed_chats` | `None` | whitelist of JIDs/numbers; `None` = everyone |
 | `typing_indicator` | `True` | show "typing…" while generating |
+| `human_batching` | `True` | collapse message bursts into one reply |
+| `batch_window_seconds` | `6.0` | quiet-time before answering a burst |
+| `batch_max_wait_seconds` | `30.0` | hard cap so trickle can't stall forever |
 | `mark_read` | `True` | blue-double-check incoming messages we handle |
 | `enable_builtin_tools` | `True` | calculator, clock, persistent per-chat notes |
 

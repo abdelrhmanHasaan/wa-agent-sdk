@@ -65,6 +65,7 @@ wa-agent-sdk/
     ├── qr.py                    terminal QR rendering
     ├── memory.py                ConversationMemory (per-chat trimming)
     ├── safety.py                SafetyManager (anti-ban gates)
+    ├── batching.py              MessageBatcher — burst debounce + interrupt
     ├── router.py                AgentRouter + TriggerBoard
     ├── routing.py               ProviderRouter + UsageTracker (multi-API)
     ├── scheduler.py             Scheduler (every/at/remind_after), Job
@@ -168,13 +169,12 @@ run_forever()                      signal handlers → Ctrl-C sets stop_event
 stop()                             cancel jobs/tasks → bridge.stop() → aclose providers/router
 ```
 
-**Incoming-message pipeline** (per message, serialised per chat via
-`_chat_locks`, global concurrency capped by semaphore(4)):
+**Incoming-message pipeline** (global concurrency capped by semaphore(4)):
 
 ```
 _process_message(msg)
  1. drop from_me · status@broadcast · groups (if ignore_groups) · not allowed_chats
- 2. lock(chat) + semaphore
+ 2. semaphore
  3. opt-language detection        "stop/unsubscribe…"  → blocklist (+confirmation), STOP
                                   "start/subscribe…"   → unblocklist (+welcome), continue
  4. SafetyManager.gate()          trigger prefix → group mention-only → quiet hours
@@ -182,14 +182,23 @@ _process_message(msg)
  5. mark_read (blue ticks)
  6. TriggerBoard.match()          hit → humanized pause → send → done (no LLM)
  7. on_message hook               returns str → pause → send → done
- 8. AgentRouter.resolve()         persona for this chat/keyword (may override prompt/model/tools)
- 9. _build_user_message           download image → prepare_image → vision block
-                                  download doc → parse_document → <document> block
-                                  require_trigger prefix stripped from prompt
-10. memory.append(user turn)
+ 8. MessageBatcher.submit()       [batching.py, when human_batching=True]
+    ├─ cancels in-flight generation for this chat (INTERRUPTION) and re-queues
+    │  its not-yet-answered messages in front
+    ├─ _build_user_message now: image→vision block / doc→<document> block /
+    │  trigger prefix stripped — media bytes secured immediately
+    └─ restarts the quiet-window timer (6 s) capped by max_wait (30 s)
+
+ …burst settles → batcher merges queued turns into ONE user message:
+    "(You sent N messages in a row — here they are in order: …)"
+ 9. AgentRouter.resolve(last_raw) persona for this chat/keyword
+10. memory.append(merged user turn)
 11. typing ON → _generate()       tool loop (see below) → typing OFF
-12. humanized pause → send_text → memory.append(assistant turn)
+12. humanized pause → shielded send_text → memory.append(assistant turn)
 ```
+
+With `human_batching=False` steps 8–12 collapse back to the classic
+one-reply-per-message flow (per-chat lock serialises them).
 
 Any `ProviderError` becomes a friendly one-line apology to the user; media /
 document errors become their own explanatory message. Nothing ever crashes the

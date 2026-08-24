@@ -15,6 +15,7 @@ Quick start:
 """
 
 from ._version import __version__
+from .batching import MessageBatcher, merge_messages
 from .client import WhatsAppAgent, agent_from_config
 from .config import AgentConfig, LLMConfig, known_providers
 from .exceptions import (
@@ -82,6 +83,8 @@ __all__ = [
     "Scheduler",
     "Job",
     "CampaignReport",
+    "MessageBatcher",
+    "merge_messages",
     "WaAgentError",
     "BridgeError",
     "ProviderError",

@@ -7,11 +7,13 @@ import base64
 import logging
 import re
 import signal
+from collections import deque
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
 from .bridge import BaileysBridge
+from .batching import MessageBatcher
 from .config import AgentConfig, LLMConfig, replace_config
 from .context import current_chat_jid, current_message_id
 from .exceptions import (
@@ -128,6 +130,17 @@ class WhatsAppAgent:
         if self._prouter is not None:
             self._prouter.attach_storage(config.resolved_data_dir())
         self._last_endpoint_name: str | None = None
+        if config.human_batching:
+            self._batcher = MessageBatcher(
+                window=config.batch_window_seconds,
+                max_wait=config.batch_max_wait_seconds,
+                build=self._prepare_batched_context,
+                on_flush=self._flush_batched_reply,
+            )
+        else:
+            self._batcher = None
+        self._committed_batches: set[tuple[str, tuple[str, ...]]] = set()
+        self._committed_order: deque[tuple[str, tuple[str, ...]]] = deque(maxlen=400)
         self._bridge: BaileysBridge | None = None
         self._ready = asyncio.Event()
         self._stop_event = asyncio.Event()
@@ -280,6 +293,8 @@ class WhatsAppAgent:
 
     async def stop(self) -> None:
         self._stop_event.set()
+        if self._batcher is not None:
+            self._batcher.cancel_all()
         cancelled_jobs = self.scheduler.cancel_all()
         if cancelled_jobs:
             log.info("Cancelled %d scheduled job(s)", cancelled_jobs)
@@ -526,10 +541,114 @@ class WhatsAppAgent:
         if not cfg.is_chat_allowed(message.chat_jid):
             return
 
-        lock = self._chat_locks.setdefault(message.chat_jid, asyncio.Lock())
-        async with lock:
-            async with self._semaphore:
-                await self._reply_pipeline(message)
+        async with self._semaphore:
+            if cfg.human_batching:
+                await self._intake_message(message)
+            else:
+                lock = self._chat_locks.setdefault(message.chat_jid, asyncio.Lock())
+                async with lock:
+                    await self._reply_pipeline(message)
+
+    async def _intake_message(self, message: IncomingMessage) -> None:
+        """Immediate per-message work (opt-outs, gate, triggers, hooks) then batch."""
+        bot_number = jid_to_number(self._bot_jid) if self._bot_jid else None
+
+        opt = self.safety.detect_opt_language(message.body_text)
+        if opt == "out":
+            if self.safety.set_blocked(message.chat_jid, True):
+                await self.send_text(
+                    message.chat_jid,
+                    "You've been unsubscribed. Send 'START' any time to receive "
+                    "messages again.",
+                )
+            return
+        if opt == "in" and self.safety.is_blocked(message.chat_jid):
+            self.safety.set_blocked(message.chat_jid, False)
+            await self.send_text(message.chat_jid, "Welcome back! You're subscribed again. ✅")
+            return
+
+        decision = self.safety.gate(message, bot_number=bot_number)
+        if not decision.allowed:
+            log.debug("Safety gate denied %s (%s)", message.id, decision.reason)
+            return
+
+        if self.config.mark_read and self._bridge is not None:
+            try:
+                await self._bridge.mark_read(message.id, message.chat_jid, message.sender_jid)
+            except WaAgentError:
+                pass
+
+        trigger_reply = await self.triggers.match(message)
+        if trigger_reply is not None:
+            if trigger_reply.strip():
+                await self.safety.pause_before_send()
+                await self.send_text(message.chat_jid, trigger_reply)
+            return
+
+        if self._message_hook is not None:
+            try:
+                hook_reply = await self._message_hook(message)
+            except Exception:  # noqa: BLE001
+                log.exception("on_message hook raised; falling back to AI reply")
+                hook_reply = None
+            if isinstance(hook_reply, str) and hook_reply.strip():
+                await self.safety.pause_before_send()
+                await self.send_text(message.chat_jid, hook_reply)
+                return
+
+        await self._batcher.submit(message)
+
+    async def _prepare_batched_context(self, message: IncomingMessage):
+        use_router = self._prouter is not None
+        vision_ok = (
+            self._prouter.any_supports_vision() if use_router
+            else getattr(self._provider_for(self.config.llm), "supports_vision", True)
+        )
+        return await self._build_user_message(message, vision_ok=vision_ok)
+
+    async def _flush_batched_reply(
+        self,
+        merged: ChatMessage,
+        last_raw: IncomingMessage,
+        ids: list[str],
+    ) -> None:
+        chat_jid = last_raw.chat_jid
+        signature = (chat_jid, tuple(ids))
+        if signature in self._committed_batches:
+            log.debug("Batch %s already committed; skipping", signature[1][-1])
+            return
+        self._committed_batches.add(signature)
+        self._committed_order.append(signature)
+        while len(self._committed_order) == self._committed_order.maxlen:
+            old = self._committed_order.popleft()
+            self._committed_batches.discard(old)
+
+        route = self.router.resolve(last_raw)
+        self.memory.append(chat_jid, merged)
+
+        token_jid = current_chat_jid.set(chat_jid)
+        token_mid = current_message_id.set(ids[-1] if ids else "")
+        if self.config.typing_indicator:
+            await self.send_typing(chat_jid, True)
+        try:
+            reply_text = await self._generate(chat_jid, route=route)
+        except ProviderError as exc:
+            log.error("LLM provider error: %s", exc)
+            reply_text = f"⚠️ My AI backend had a problem: {str(exc)[:300]}"
+        finally:
+            if self.config.typing_indicator:
+                await self.send_typing(chat_jid, False)
+            current_chat_jid.reset(token_jid)
+            current_message_id.reset(token_mid)
+
+        reply_text = reply_text.strip()
+        if reply_text:
+            self.memory.append(
+                chat_jid, ChatMessage(role="assistant", content=reply_text)
+            )
+            await self.safety.pause_before_send()
+            # once we start sending, an interruption must not split the message
+            await asyncio.shield(self.send_text(chat_jid, reply_text))
 
     async def _reply_pipeline(self, message: IncomingMessage) -> None:
         cfg = self.config

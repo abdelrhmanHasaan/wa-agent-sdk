@@ -130,6 +130,10 @@ class AgentConfig:
     ignore_groups: bool = True
     allowed_chats: frozenset[str] | set[str] | list[str] | tuple[str, ...] | None = None
 
+    human_batching: bool = True
+    batch_window_seconds: float = 6.0
+    batch_max_wait_seconds: float = 30.0
+
     enable_safety: bool = True
     require_trigger: str | None = None
     group_mention_only: bool = True
