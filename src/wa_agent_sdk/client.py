@@ -1,0 +1,564 @@
+"""The high-level :class:`WhatsAppAgent` — QR linking, AI replies, tools, hooks."""
+
+from __future__ import annotations
+
+import asyncio
+import base64
+import logging
+import signal
+from datetime import datetime
+from pathlib import Path
+from typing import Any, Awaitable, Callable
+
+from .bridge import BaileysBridge
+from .config import AgentConfig, LLMConfig, replace_config
+from .context import current_chat_jid, current_message_id
+from .exceptions import (
+    MediaError,
+    ProviderError,
+    QRTimeoutError,
+    UnsupportedDocumentError,
+    WaAgentError,
+)
+from .llm.base import BaseChatProvider, ChatMessage, image_block, text_block
+from .llm.factory import create_provider
+from .memory import ConversationMemory
+from .models import IncomingMessage, MediaType, SentReceipt, jid_to_number
+from .qr import print_pairing_qr
+from .safety import SafetyManager
+from .tools.base import Tool, ToolRegistry, tool_from_callable
+from .tools.builtin import create_builtin_tools
+from .tools.documents import format_document_block, parse_document
+from .tools.media import detect_image_mime, prepare_image
+
+log = logging.getLogger("wa_agent")
+
+MessageHook = Callable[[IncomingMessage], Awaitable[Any]]
+ReadyHook = Callable[[], Awaitable[None]]
+QrHook = Callable[[str], Awaitable[bool]]
+
+
+class WhatsAppAgent:
+    """An AI agent reachable through your own WhatsApp number.
+
+    Usage:
+        agent = WhatsAppAgent(
+            llm=LLMConfig(provider="openai", model="gpt-4o-mini", api_key="sk-..."),
+            system_prompt="You are a helpful assistant.",
+        )
+        agent.run()          # shows a QR code, then serves messages forever
+    """
+
+    _LLM_FIELDS = frozenset(
+        {"provider", "model", "api_key", "base_url", "temperature", "max_tokens",
+         "request_timeout", "max_retries"}
+    )
+
+    def __init__(self, llm: LLMConfig | AgentConfig | dict | None = None, **overrides: Any) -> None:
+        if llm is None and not overrides:
+            raise WaAgentError(
+                "Usage: WhatsAppAgent(llm=LLMConfig(provider=..., model=..., api_key=...), ...)"
+            )
+        if isinstance(llm, AgentConfig):
+            config = replace_config(llm, **overrides) if overrides else llm
+        elif isinstance(llm, LLMConfig):
+            config = AgentConfig(llm=llm, **overrides) if overrides else AgentConfig(llm=llm)
+        elif isinstance(llm, dict) or llm is None:
+            merged: dict[str, Any] = {**(llm or {}), **overrides}
+            llm_kwargs = {
+                key: merged.pop(key) for key in list(merged) if key in self._LLM_FIELDS
+            }
+            if "provider" not in llm_kwargs or "model" not in llm_kwargs:
+                raise WaAgentError("Dict-style construction needs at least provider= and model=")
+            config = AgentConfig(llm=LLMConfig(**llm_kwargs), **merged)
+        else:
+            raise WaAgentError(
+                "Pass llm=LLMConfig(...) (or an AgentConfig / a dict with provider & model)"
+            )
+        config.llm.info  # validates the provider name early
+        self._setup(config)
+
+    def _setup(self, config: AgentConfig) -> None:
+        self.config = config
+        self.tools = ToolRegistry()
+        if config.enable_builtin_tools:
+            for t in create_builtin_tools(config.resolved_data_dir()):
+                self.tools.register(t)
+
+        self.memory = ConversationMemory(
+            max_messages=config.max_history_messages,
+            max_chars=config.max_context_chars,
+        )
+        self.safety = SafetyManager(
+            config.resolved_data_dir(),
+            enabled=config.enable_safety,
+            group_mention_only=config.group_mention_only,
+            require_trigger=config.require_trigger,
+            reply_cooldown=config.reply_cooldown,
+            global_hourly_limit=config.global_hourly_limit,
+            per_chat_daily_limit=config.per_chat_daily_limit,
+            new_chat_daily_limit=config.new_chat_daily_limit,
+            quiet_hours=config.quiet_hours,
+            humanize_min_delay=config.humanize_min_delay,
+            humanize_max_delay=config.humanize_max_delay,
+        )
+        self._provider: BaseChatProvider | None = None
+        self._bridge: BaileysBridge | None = None
+        self._ready = asyncio.Event()
+        self._stop_event = asyncio.Event()
+        self._bot_jid: str | None = None
+        self._bot_name: str | None = None
+        self._last_qr: str | None = None
+        self._message_hook: MessageHook | None = None
+        self._ready_hook: ReadyHook | None = None
+        self._qr_hook: QrHook | None = None
+        self._chat_locks: dict[str, asyncio.Lock] = {}
+        self._semaphore = asyncio.Semaphore(4)
+        self._background_tasks: set[asyncio.Task] = set()
+
+    # ------------------------------------------------------------------ hooks
+
+    def on_message(self, fn: MessageHook) -> MessageHook:
+        """Decorator: intercept every incoming message.
+
+        Return a string from the hook to reply directly and skip the LLM,
+        or return None to let the normal AI pipeline handle the message.
+        """
+        self._message_hook = fn
+        return fn
+
+    def on_ready(self, fn: ReadyHook) -> ReadyHook:
+        """Decorator: called once WhatsApp reports the session as open."""
+        self._ready_hook = fn
+        return fn
+
+    def on_qr(self, fn: QrHook) -> QrHook:
+        """Decorator: custom QR handling. Return True when fully handled."""
+        self._qr_hook = fn
+        return fn
+
+    def register_tool(self, item: Tool | Callable[..., Any], **kwargs: Any) -> Tool:
+        """Add an extra tool the model may call. Accepts a Tool or typed function."""
+        resolved = item if isinstance(item, Tool) else tool_from_callable(item, **kwargs)
+        self.tools.register(resolved)
+        return resolved
+
+    # -------------------------------------------------------------- lifecycle
+
+    @property
+    def bot_jid(self) -> str | None:
+        return self._bot_jid
+
+    @property
+    def is_connected(self) -> bool:
+        return self._ready.is_set()
+
+    async def start(self) -> None:
+        """Start the bridge and wait until WhatsApp links this device."""
+        if self._provider is None:
+            self._provider = create_provider(self.config.llm)
+        if self._bridge is None:
+            self._bridge = BaileysBridge(
+                auth_dir=self.config.resolved_sessions_dir() / self.config.session_name,
+                event_handler=self._on_bridge_event,
+                log_level=self.config.log_level,
+                max_restarts=self.config.max_bridge_restarts,
+            )
+        await self._bridge.start()
+        try:
+            await asyncio.wait_for(self._ready.wait(), timeout=self.config.qr_timeout)
+        except asyncio.TimeoutError as exc:
+            raise QRTimeoutError(
+                "No one scanned the pairing QR in time. Call start() again for a fresh code."
+            ) from exc
+
+    async def run_forever(self) -> None:
+        """Serve incoming messages until :meth:`stop` is awaited."""
+        if not self.is_connected:
+            await self.start()
+        self._install_signal_handlers()
+        print(f"\n✅ {self._label()} connected. Waiting for messages… (Ctrl+C to quit)\n")
+        await self._stop_event.wait()
+
+    async def stop(self) -> None:
+        self._stop_event.set()
+        for task in list(self._background_tasks):
+            task.cancel()
+        self._background_tasks.clear()
+        if self._bridge is not None:
+            await self._bridge.stop()
+        if self._provider is not None:
+            await self._provider.aclose()
+        self._ready.clear()
+
+    async def __aenter__(self) -> "WhatsAppAgent":
+        await self.start()
+        return self
+
+    async def __aexit__(self, *exc_info: object) -> None:
+        await self.stop()
+
+    def run(self) -> None:
+        """Synchronous convenience wrapper around ``start()`` + ``run_forever()``."""
+        try:
+            asyncio.run(self._run_managed())
+        except KeyboardInterrupt:
+            pass
+
+    async def _run_managed(self) -> None:
+        try:
+            await self.start()
+            await self.run_forever()
+        except KeyboardInterrupt:
+            await self.stop()
+
+    def _install_signal_handlers(self) -> None:
+        loop = asyncio.get_running_loop()
+        for sig_name in ("SIGINT", "SIGTERM"):
+            sig = getattr(signal, sig_name, None)
+            if sig is None:
+                continue
+            try:
+                loop.add_signal_handler(sig, self._request_stop)
+            except NotImplementedError:  # pragma: no cover - Windows
+                continue
+
+    def _request_stop(self) -> None:
+        self._stop_event.set()
+
+    def _label(self) -> str:
+        number = jid_to_number(self._bot_jid) if self._bot_jid else "?"
+        name = self._bot_name or "WhatsApp"
+        return f"{name} (+{number})"
+
+    # ---------------------------------------------------------------- sending
+
+    async def send_text(self, to: str, text: str) -> SentReceipt:
+        if self._bridge is None:
+            raise WaAgentError("Agent is not started")
+        msg_id = await self._bridge.send_text(to, text)
+        return SentReceipt(id=msg_id, to=to)
+
+    async def send_image(
+        self,
+        to: str,
+        source: str | Path | bytes,
+        caption: str = "",
+    ) -> SentReceipt:
+        data_b64, mime = await self._load_image(source)
+        return await self._send_media(to, "image", data_b64, mimetype=mime, caption=caption)
+
+    async def send_document(
+        self,
+        to: str,
+        path: str | Path | bytes,
+        filename: str | None = None,
+        caption: str = "",
+    ) -> SentReceipt:
+        data, name = self._load_bytes(path, filename)
+        data_b64 = base64.b64encode(data).decode("ascii")
+        mime = detect_image_mime(data) or "application/octet-stream"
+        if name and name.lower().endswith(".pdf"):
+            mime = "application/pdf"
+        return await self._send_media(to, "document", data_b64, mimetype=mime, filename=name, caption=caption)
+
+    async def send_audio(self, to: str, path: str | Path | bytes, voice_note: bool = False) -> SentReceipt:
+        data, name = self._load_bytes(path, None)
+        data_b64 = base64.b64encode(data).decode("ascii")
+        mime = "audio/ogg; codecs=opus" if voice_note else "audio/mpeg"
+        return await self._send_media(to, "audio", data_b64, mimetype=mime, ptt=voice_note)
+
+    async def send_typing(self, chat_jid: str, on: bool = True) -> None:
+        if self._bridge is None:
+            return
+        await self._bridge.set_presence("composing" if on else "paused", chat_jid)
+
+    async def broadcast(self, jids: list[str], text: str) -> list[SentReceipt]:
+        receipts: list[SentReceipt] = []
+        for jid in jids:
+            receipts.append(await self.send_text(jid, text))
+            await asyncio.sleep(0.6)
+        return receipts
+
+    async def _send_media(self, *args: Any, **kwargs: Any) -> SentReceipt:
+        if self._bridge is None:
+            raise WaAgentError("Agent is not started")
+        msg_id = await self._bridge.send_media(*args, **kwargs)
+        return SentReceipt(id=msg_id, to=args[0])
+
+    @staticmethod
+    def _load_bytes(source: str | Path | bytes, filename: str | None) -> tuple[bytes, str | None]:
+        if isinstance(source, bytes):
+            return source, filename
+        path = Path(source)
+        return path.read_bytes(), filename or path.name
+
+    @staticmethod
+    async def _load_image(source: str | Path | bytes) -> tuple[str, str]:
+        data = source if isinstance(source, bytes) else Path(source).read_bytes()
+        prepared, mime = prepare_image(data)
+        return prepared, mime
+
+    # ---------------------------------------------------------------- events
+
+    async def _on_bridge_event(self, event: str, payload: dict) -> None:
+        if event == "qr":
+            await self._handle_qr(payload.get("qr", ""))
+        elif event == "ready":
+            await self._handle_ready(payload)
+        elif event == "message":
+            message = IncomingMessage.model_validate(payload.get("payload") or {})
+            self._spawn_background(self._process_message(message))
+        elif event == "disconnected":
+            reason = payload.get("reason", "")
+            level = log.warning if payload.get("logged_out") else log.info
+            level("WhatsApp connection closed (%s); bridge will reconnect", reason)
+            if payload.get("logged_out"):
+                self._ready.clear()
+        elif event == "fatal":
+            log.error("Bridge fatal: %s", payload.get("error"))
+        elif event == "hello":
+            log.debug("Bridge handshake complete")
+
+    async def _handle_qr(self, qr_data: str) -> None:
+        if not qr_data:
+            return
+        self._last_qr = qr_data
+        handled = False
+        if self._qr_hook is not None:
+            handled = bool(await self._qr_hook(qr_data))
+        if not handled:
+            print_pairing_qr(qr_data)
+
+    async def _handle_ready(self, payload: dict) -> None:
+        first_time = not self._ready.is_set()
+        self._bot_jid = payload.get("jid")
+        self._bot_name = payload.get("name")
+        self._ready.set()
+        if self._ready_hook is not None:
+            try:
+                await self._ready_hook()
+            except Exception:  # noqa: BLE001
+                log.exception("on_ready hook raised")
+        if first_time:
+            log.info("Linked as %s", self._label())
+
+    def _spawn_background(self, coro) -> None:
+        task = asyncio.create_task(coro)
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
+
+    # ------------------------------------------------------------ message flow
+
+    async def _process_message(self, message: IncomingMessage) -> None:
+        cfg = self.config
+        if message.from_me:
+            return
+        if message.chat_jid == "status@broadcast":
+            return
+        if message.is_group and cfg.ignore_groups:
+            return
+        if not cfg.is_chat_allowed(message.chat_jid):
+            return
+
+        lock = self._chat_locks.setdefault(message.chat_jid, asyncio.Lock())
+        async with lock:
+            async with self._semaphore:
+                await self._reply_pipeline(message)
+
+    async def _reply_pipeline(self, message: IncomingMessage) -> None:
+        cfg = self.config
+        bot_number = jid_to_number(self._bot_jid) if self._bot_jid else None
+
+        opt = self.safety.detect_opt_language(message.body_text)
+        if opt == "out":
+            if self.safety.set_blocked(message.chat_jid, True):
+                await self.send_text(
+                    message.chat_jid,
+                    "You've been unsubscribed. Send 'START' any time to receive messages again.",
+                )
+            return
+        if opt == "in" and self.safety.is_blocked(message.chat_jid):
+            self.safety.set_blocked(message.chat_jid, False)
+            await self.send_text(message.chat_jid, "Welcome back! You're subscribed again. ✅")
+            return
+
+        decision = self.safety.gate(message, bot_number=bot_number)
+        if not decision.allowed:
+            log.debug("Safety gate denied %s (%s)", message.id, decision.reason)
+            return
+
+        if cfg.mark_read and self._bridge is not None:
+            try:
+                await self._bridge.mark_read(message.id, message.chat_jid, message.sender_jid)
+            except WaAgentError:
+                pass
+
+        if self._message_hook is not None:
+            try:
+                hook_reply = await self._message_hook(message)
+            except Exception:  # noqa: BLE001
+                log.exception("on_message hook raised; falling back to AI reply")
+                hook_reply = None
+            if isinstance(hook_reply, str) and hook_reply.strip():
+                await self.safety.pause_before_send()
+                await self.send_text(message.chat_jid, hook_reply)
+                return
+
+        try:
+            user_msg = await self._build_user_message(message)
+        except (MediaError, UnsupportedDocumentError) as exc:
+            await self.send_text(message.chat_jid, f"⚠️ Could not process your attachment: {exc}")
+            return
+        except Exception:  # noqa: BLE001
+            log.exception("Failed to build context for %s", message.id)
+            return
+
+        if user_msg is None:
+            return
+
+        self.memory.append(message.chat_jid, user_msg)
+        token_jid = current_chat_jid.set(message.chat_jid)
+        token_mid = current_message_id.set(message.id)
+        if cfg.typing_indicator:
+            await self.send_typing(message.chat_jid, True)
+        try:
+            reply_text = await self._generate(message.chat_jid)
+        except ProviderError as exc:
+            log.error("LLM provider error: %s", exc)
+            reply_text = f"⚠️ My AI backend had a problem: {str(exc)[:300]}"
+        finally:
+            if cfg.typing_indicator:
+                await self.send_typing(message.chat_jid, False)
+            current_chat_jid.reset(token_jid)
+            current_message_id.reset(token_mid)
+
+        reply_text = reply_text.strip()
+        if reply_text:
+            self.memory.append(message.chat_jid, ChatMessage(role="assistant", content=reply_text))
+            await self.safety.pause_before_send()
+            await self.send_text(message.chat_jid, reply_text)
+
+    async def _build_user_message(self, message: IncomingMessage) -> ChatMessage | None:
+        cfg = self.config
+        blocks: list[dict[str, Any]] = []
+        caption = (message.caption or "").strip()
+        body = (message.text or "").strip()
+
+        if message.has_media and message.media_type == MediaType.IMAGE:
+            if cfg.handle_images and self._bridge is not None and self._provider is not None \
+                    and getattr(self._provider, "supports_vision", True):
+                raw_b64, _mime = await self._bridge.download_media(message.id)
+                img_b64, img_mime = prepare_image(base64.b64decode(raw_b64), max_side=cfg.max_image_side_px)
+                blocks.append(image_block(img_mime, img_b64))
+            else:
+                caption = f"{caption}\n(The user sent an image; it is not shown to this model.)".strip()
+
+        if message.has_media and message.media_type == MediaType.DOCUMENT \
+                and cfg.handle_documents and self._bridge is not None:
+            raw_b64, _mime = await self._bridge.download_media(message.id)
+            doc = parse_document(
+                message.filename or "document",
+                base64.b64decode(raw_b64),
+                max_chars=cfg.max_document_chars,
+            )
+            blocks.append(text_block(format_document_block(doc)))
+
+        prompt_parts = [p for p in (body, caption) if p]
+        trigger = self.config.require_trigger
+        if body and trigger and body.lower().startswith(trigger.lower()):
+            body = body[len(trigger):].lstrip()
+            prompt_parts = [p for p in (body, caption) if p]
+        if blocks:
+            blocks.append(text_block(prompt_parts[-1] if prompt_parts else "(see attachment above)"))
+            return ChatMessage(role="user", content=blocks)
+
+        text = "\n".join(prompt_parts).strip()
+        if not text:
+            note = self._media_placeholder(message)
+            if note is None:
+                return None
+            text = note
+        return ChatMessage(role="user", content=text)
+
+    @staticmethod
+    def _media_placeholder(message: IncomingMessage) -> str | None:
+        mapping = {
+            MediaType.AUDIO: "(The user sent a voice note. Transcription is not configured — "
+            "politely say you cannot listen yet.)",
+            MediaType.VIDEO: "(The user sent a video. Politely acknowledge it; you can only read "
+            "text captions.)",
+            MediaType.STICKER: "(The user sent a sticker.)",
+            MediaType.CONTACT: message.text,
+            MediaType.LOCATION: message.text,
+        }
+        return mapping.get(message.media_type, message.text)
+
+    def _system_prompt(self) -> str:
+        today = datetime.now().strftime("%A, %d %B %Y (%H:%M local)")
+        extras = [
+            self.config.system_prompt,
+            "",
+            f"Current date/time: {today}.",
+            "You are chatting over WhatsApp. Keep replies short and conversational.",
+            "Attachments arrive inline: images are visible to you; documents appear inside "
+            "<document> tags with their extracted text.",
+        ]
+        if len(self.tools):
+            names = ", ".join(sorted(self.tools.names()))
+            extras.append(f"You can call these tools when useful: {names}.")
+        return "\n".join(extras)
+
+    async def _generate(self, chat_jid: str) -> str:
+        provider = self._provider
+        if provider is None:
+            raise WaAgentError("Provider not initialised")
+
+        supports_tools = bool(len(self.tools)) and getattr(provider, "supports_tools", True)
+        schemas = self.tools.schemas() if supports_tools else None
+        conversation = [
+            ChatMessage(role="system", content=self._system_prompt()),
+            *self.memory.history(chat_jid),
+        ]
+
+        result_text = ""
+        for _iteration in range(max(1, self.config.max_tool_iterations)):
+            result = await provider.chat(conversation, tools=schemas)
+            if not result.has_tool_calls:
+                result_text = result.text
+                break
+
+            conversation.append(
+                ChatMessage(role="assistant", content=result.text or None, tool_calls=result.tool_calls)
+            )
+            for call in result.tool_calls:
+                tool_obj = self.tools.get(call.name)
+                if tool_obj is None:
+                    output = f"Error: unknown tool '{call.name}'"
+                else:
+                    log.info("Tool call: %s(%s)", call.name, call.args)
+                    output = await tool_obj.run(call.args)
+                    log.debug("Tool %s -> %.200s", call.name, output)
+                conversation.append(
+                    ChatMessage(
+                        role="tool",
+                        content=output,
+                        tool_call_id=call.id,
+                        name=call.name,
+                    )
+                )
+        else:
+            result_text = ""
+
+        return result_text
+
+
+def agent_from_config(**kwargs: Any) -> WhatsAppAgent:
+    """Build an :class:`WhatsAppAgent` straight from keyword configuration."""
+    llm_kwargs = {
+        key: kwargs.pop(key)
+        for key in ("provider", "model", "api_key", "base_url", "temperature", "max_tokens")
+        if key in kwargs
+    }
+    config = replace_config(AgentConfig(llm=LLMConfig(**llm_kwargs)), **kwargs)
+    return WhatsAppAgent(config)

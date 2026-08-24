@@ -1,0 +1,16 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+.env
+
+.wa_sessions/
+.wa_data/
+.wa_auth/
+*.log
+
+node_modules/
+package-lock.json
