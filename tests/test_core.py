@@ -135,6 +135,27 @@ def test_agent_construction_with_builtin_tools():
     assert "Current date/time" in sp and "calculate" in sp
 
 
+def test_system_prompt_claims_match_actual_capabilities():
+    agent = WhatsAppAgent(llm=LLMConfig(provider="openai", model="m", api_key="k"))
+    sp = agent._system_prompt()
+    # capabilities asserted confidently + document response format taught
+    assert "never deny or doubt" in sp
+    assert "PDF, DOCX, Markdown" in sp
+    assert "short summary" in sp and "📋 Details" in sp
+    assert "cannot process audio/video" in sp
+
+    limited = WhatsAppAgent(
+        llm=LLMConfig(provider="openai", model="m", api_key="k"),
+        handle_documents=False,
+        handle_images=False,
+        enable_builtin_tools=False,
+    )
+    lp = limited._system_prompt()
+    assert "PDF, DOCX, Markdown" not in lp          # no false capability claims
+    assert "document parsing is disabled" in lp
+    assert "- See images." in lp
+
+
 def test_notes_roundtrip_scoped_by_chat():
     from wa_agent_sdk import context
 

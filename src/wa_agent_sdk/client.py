@@ -687,18 +687,64 @@ class WhatsAppAgent:
 
     def _system_prompt(self, base: str | None = None) -> str:
         today = datetime.now().strftime("%A, %d %B %Y (%H:%M local)")
-        extras = [
-            base if base is not None else self.config.system_prompt,
+        cfg = self.config
+
+        can: list[str] = []
+        if cfg.handle_documents:
+            can.append(
+                "- Parse and deeply analyze attached documents (PDF, DOCX, Markdown, "
+                "TXT, CSV, JSON, HTML). Their extracted text is handed to you inside "
+                "<document> tags — treat it as fully readable and quote from it freely."
+            )
+        if cfg.handle_images:
+            can.append(
+                "- See and reason about images, photos and screenshots people send."
+            )
+        if len(self.tools):
+            can.append(
+                "- Call these tools whenever they help: "
+                + ", ".join(sorted(self.tools.names()))
+                + "."
+            )
+        can.append("- Know the current date and time.")
+
+        cannot: list[str] = [
+            "- Listen to voice notes or watch videos. If one arrives, say politely "
+            "that you cannot process audio/video yet."
+        ]
+        if not cfg.handle_documents:
+            cannot.append("- Read attached documents (document parsing is disabled).")
+        if not cfg.handle_images:
+            cannot.append("- See images.")
+
+        lines = [
+            base if base is not None else cfg.system_prompt,
             "",
             f"Current date/time: {today}.",
-            "You are chatting over WhatsApp. Keep replies short and conversational.",
-            "Attachments arrive inline: images are visible to you; documents appear inside "
-            "<document> tags with their extracted text.",
+            "You are chatting over WhatsApp: keep messages short and conversational.",
+            "",
+            "You ARE capable of all of the following — never deny or doubt them:",
+            *can,
+            "",
+            "You are NOT able to:",
+            *cannot,
         ]
-        if len(self.tools):
-            names = ", ".join(sorted(self.tools.names()))
-            extras.append(f"You can call these tools when useful: {names}.")
-        return "\n".join(extras)
+
+        if cfg.handle_documents:
+            lines += [
+                "",
+                "When a document is attached, answer like this:",
+                "1. Start with a short summary (2-5 sentences): what the file is and "
+                "its main takeaways.",
+                "2. Then a section titled '📋 Details' with a clean structured "
+                "breakdown: headings, bullets, key numbers/tables — organized, never "
+                "a raw text dump.",
+                "3. Close by offering to go deeper on any part.",
+                "4. If the extracted text is empty or garbled (scanned file), say "
+                "exactly that instead of inventing contents.",
+            ]
+
+        return "\n".join(lines)
 
     def _provider_for(self, llm: LLMConfig) -> BaseChatProvider:
         """Provider cache — one HTTP client per (provider, model) combo."""
