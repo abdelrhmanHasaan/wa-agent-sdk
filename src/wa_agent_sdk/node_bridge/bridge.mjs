@@ -158,12 +158,21 @@ function cacheMedia(raw, norm) {
   mediaCache.set(norm.id, { raw, mimetype: norm.mimetype });
 }
 
+const withTimeout = (promise, ms, label) =>
+  Promise.race([
+    promise,
+    new Promise((_, reject) =>
+      setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms)
+    ),
+  ]);
+
 async function startWhatsApp() {
   const { state, saveCreds } = await wa.useMultiFileAuthState(AUTH_DIR);
   let version;
   try {
-    ({ version } = await wa.fetchLatestBaileysVersion());
-  } catch {
+    ({ version } = await withTimeout(wa.fetchLatestBaileysVersion(), 10000, "version fetch"));
+  } catch (err) {
+    logger.warn({ err: String(err?.message || err) }, "version fetch failed; using baked-in default");
     version = undefined;
   }
 
@@ -309,6 +318,7 @@ const wss = new WebSocketServer({ host: "127.0.0.1", port: PORT });
 wss.on("listening", () => {
   logger.info({ port: PORT }, "bridge listening");
 });
+
 
 wss.on("connection", (ws, req) => {
   const url = new URL(req.url || "/", "http://127.0.0.1");

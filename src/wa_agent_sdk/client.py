@@ -119,6 +119,8 @@ class WhatsAppAgent:
         self._bot_jid: str | None = None
         self._bot_name: str | None = None
         self._last_qr: str | None = None
+        self._saw_qr = False
+        self._qr_count = 0
         self._message_hook: MessageHook | None = None
         self._ready_hook: ReadyHook | None = None
         self._qr_hook: QrHook | None = None
@@ -185,6 +187,8 @@ class WhatsAppAgent:
 
     async def start(self) -> None:
         """Start the bridge and wait until WhatsApp links this device."""
+        if self._ready.is_set():
+            return
         if self._provider is None:
             self._provider = create_provider(self.config.llm)
         if self._bridge is None:
@@ -195,12 +199,61 @@ class WhatsAppAgent:
                 max_restarts=self.config.max_bridge_restarts,
             )
         await self._bridge.start()
+        self._saw_qr = False
         try:
             await asyncio.wait_for(self._ready.wait(), timeout=self.config.qr_timeout)
         except asyncio.TimeoutError as exc:
-            raise QRTimeoutError(
-                "No one scanned the pairing QR in time. Call start() again for a fresh code."
-            ) from exc
+            raise self._qr_failure_error() from exc
+
+    def _qr_failure_error(self) -> QRTimeoutError:
+        """Turn a linking timeout into an actionable diagnostic."""
+        head = (
+            f"Linking timed out after {self.config.qr_timeout:.0f}s "
+            f"(attempt budget: {self.config.qr_max_attempts} via agent.run())."
+        )
+        session_dir = (
+            self.config.resolved_sessions_dir() / self.config.session_name
+        )
+        if self._saw_qr:
+            tip = (
+                "QR codes were displayed but never scanned/confirmed in time.\n"
+                f"  → Scan within ~60s of each code appearing (fresh codes print automatically).\n"
+                f"  → Or raise AgentConfig(qr_timeout=..., qr_max_attempts=...)."
+            )
+        elif session_dir.exists() and any(session_dir.iterdir()):
+            tip = (
+                "No QR was ever produced and the session folder already exists — the stored\n"
+                "link is stale or corrupted, so WhatsApp skips pairing entirely.\n"
+                f"  → Delete it and rerun:\n"
+                f"     PowerShell : Remove-Item -Recurse -Force \"{session_dir}\"\n"
+                f"     cmd        : rmdir /s /q \"{session_dir}\"\n"
+                f"  → or call   : await agent.unlink()"
+            )
+        else:
+            logs_dir = self.config.resolved_sessions_dir() / "logs"
+            tip = (
+                "No QR was produced at all — the bridge could not reach WhatsApp.\n"
+                f"  → Check bridge logs: {logs_dir}\n"
+                f"  → Common causes: no internet, firewall/proxy blocking WhatsApp web,\n"
+                f"     or Node < 18."
+            )
+        return QRTimeoutError(f"{head}\n{tip}")
+
+    async def unlink(self) -> None:
+        """Unlink this device and wipe stored credentials for a fresh QR next run."""
+        session_dir = self.config.resolved_sessions_dir() / self.config.session_name
+        if self._bridge is not None and self._bridge.running:
+            try:
+                await self._bridge.logout()
+            except WaAgentError:
+                pass
+        import shutil
+
+        shutil.rmtree(session_dir, ignore_errors=True)
+        self._ready.clear()
+        self._bot_jid = None
+        self._bot_name = None
+        print("🔓 Unlinked. Next start() will show a fresh pairing QR.")
 
     async def run_forever(self) -> None:
         """Serve incoming messages until :meth:`stop` is awaited."""
@@ -247,8 +300,20 @@ class WhatsAppAgent:
             pass
 
     async def _run_managed(self) -> None:
+        attempts = max(1, self.config.qr_max_attempts)
         try:
-            await self.start()
+            for attempt in range(1, attempts + 1):
+                try:
+                    await self.start()
+                    break
+                except QRTimeoutError as exc:
+                    if attempt == attempts:
+                        raise
+                    print(
+                        f"\n⚠️  {exc}\n"
+                        f"↻  Attempt {attempt + 1}/{attempts} — generating a fresh QR…"
+                    )
+                    await asyncio.sleep(1.0)
             await self.run_forever()
         except KeyboardInterrupt:
             await self.stop()
@@ -405,10 +470,14 @@ class WhatsAppAgent:
         if not qr_data:
             return
         self._last_qr = qr_data
+        self._saw_qr = True
+        self._qr_count += 1
         handled = False
         if self._qr_hook is not None:
             handled = bool(await self._qr_hook(qr_data))
         if not handled:
+            if self._qr_count > 1:
+                print(f"🔄 Previous code expired — fresh QR #{self._qr_count}:")
             print_pairing_qr(qr_data)
 
     async def _handle_ready(self, payload: dict) -> None:

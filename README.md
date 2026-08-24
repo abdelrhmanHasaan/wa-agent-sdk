@@ -265,6 +265,7 @@ WhatsAppAgent(llm=..., **overrides)   # overrides = AgentConfig fields
 |---|---|
 | `enable_safety` | `True` |
 | `require_trigger` | `None` (e.g. `"!bot"`) |
+| `qr_max_attempts` | `3` (auto-retries with fresh QRs in `agent.run()`) |
 | `group_mention_only` | `True` |
 | `reply_cooldown` | `3.0` s per chat |
 | `global_hourly_limit` | `80` |
@@ -553,6 +554,7 @@ await agent.send_document(jid, path_or_bytes, filename=, caption="")
 await agent.send_audio(jid, path, voice_note=False)
 await agent.send_typing(jid, True|False)
 await agent.broadcast([jids], text)
+await agent.unlink()                   # wipe link; fresh QR next start
 
 agent.bot_jid          # your linked identity once ready
 ```
@@ -586,6 +588,8 @@ import logging; logging.basicConfig(level=logging.INFO)   # DEBUG for the chatty
 | `NodeNotFoundError` | install Node LTS, reopen terminal |
 | npm install fails behind proxy | set `HTTPS_PROXY`/`HTTP_PROXY`, rerun |
 | QR scanned but nothing happens | wait ~10 s (first link is slow); check bridge log |
+| `QRTimeoutError` | `agent.run()` auto-retries 3× with fresh codes (`qr_timeout`, `qr_max_attempts`). Error message tells you exactly what to do: scan faster / delete a stale session folder / check logs |
+| No QR ever appears | stale session — the error prints the exact folder; delete it or `await agent.unlink()` |
 | Replies suddenly stop | check `agent.safety.stats()` — you likely hit a limit |
 | Bot ignores a user | they're probably STOP-listed (`is_blocked`) |
 | Bot won't shut up in a group | `group_mention_only` is on — @mention it, or set `False` |

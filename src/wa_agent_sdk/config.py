@@ -144,6 +144,7 @@ class AgentConfig:
     campaign_max_delay: float = 15.0
 
     qr_timeout: float = 180.0
+    qr_max_attempts: int = 3
     max_bridge_restarts: int = 5
     log_level: str = "INFO"
 

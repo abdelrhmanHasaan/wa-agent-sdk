@@ -12,5 +12,8 @@ venv/
 .wa_auth/
 *.log
 
+my_whatsapp_agent.py
+.env
+
 node_modules/
 package-lock.json
