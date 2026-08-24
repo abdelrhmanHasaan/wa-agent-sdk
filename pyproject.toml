@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "wa-agent-sdk"
-version = "1.0.0"
+version = "1.1.0"
 description = "Build WhatsApp AI agents on your own number via a Baileys bridge — QR pairing, no Meta verification."
 readme = "README.md"
 requires-python = ">=3.10"
