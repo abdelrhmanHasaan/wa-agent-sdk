@@ -14,6 +14,7 @@ provider + model + api key  →  scan QR  →  agent answers your WhatsApp
 | 📄 Documents | PDF · DOCX · Markdown · CSV · JSON · HTML · TXT auto-parsed into the model's context |
 | 🖼️ Images | Routed to vision models (GPT-4o, Claude, Gemini, Llama-vision…) |
 | 🧰 Tools | Function calling with automatic JSON-schema generation |
+| 🧠 Provider Router | Multiple APIs? Smart routing by complexity, cost, budgets, failover |
 | 🛡️ Anti-ban | Rate limits, cooldowns, quiet hours, STOP compliance, humanized pacing |
 | 🔀 Multi-agent | Route chats to different personas/models/tools on one number |
 | ⚡ Triggers | Instant keyword replies with zero LLM cost |
@@ -35,6 +36,7 @@ provider + model + api key  →  scan QR  →  agent answers your WhatsApp
 4. [60-second quickstart](#60-second-quickstart)
 5. [Linking your number (QR)](#linking-your-number-qr)
 6. [Providers](#providers)
+   - [Smart Provider Router (multi-API)](#smart-provider-router-multi-api)
 7. [Configuration reference](#configuration-reference)
 8. [🛡️ Anti-ban protection](#️-anti-ban-protection-stay-unbanned)
 9. [Use-case guides](#use-case-guides)
@@ -149,11 +151,90 @@ Notes:
 - Missing keys raise `ProviderAuthError` naming the expected env var; unknown
   providers raise a suggestion ("Did you mean: openai?").
 
+## Smart Provider Router (multi-API)
+
+Have several API keys — Groq for speed, OpenAI for brains, Gemini as backup?
+Attach a `ProviderRouter` and every reply is placed on the **best available
+endpoint** automatically, with budgets, failover and usage accounting.
+
+```python
+from wa_agent_sdk import LLMConfig, ModelEndpoint, ProviderRouter, WhatsAppAgent
+
+router = ProviderRouter(strategy="smart")
+router.add(ModelEndpoint(
+    name="groq-fast",
+    llm=LLMConfig(provider="groq", model="llama-3.3-70b-versatile", api_key="..."),
+    tier="fast",                       # handles simple chatter cheaply
+    price_input_per_m=0.59, price_output_per_m=0.79,
+))
+router.add(ModelEndpoint(
+    name="gpt4o",
+    llm=LLMConfig(provider="openai", model="gpt-4o", api_key="..."),
+    tier="smart",                      # heavy lifting: docs, analysis, tools
+    price_input_per_m=2.50, price_output_per_m=10.0,
+    daily_budget_usd=5.0,              # hard stop after $5/day
+))
+router.add(ModelEndpoint(
+    name="gemini-backup",
+    llm=LLMConfig(provider="gemini", model="gemini-2.0-flash", api_key="..."),
+    tier="balanced", priority=1,       # also the failover safety net
+))
+
+agent = WhatsAppAgent(llm=LLMConfig(provider="openai", model="gpt-4o-mini", api_key="..."),
+                      provider_router=router)
+agent.run()
+```
+
+### How each message is placed
+
+| strategy | decision |
+|---|---|
+| `smart` *(default)* | Scores query complexity 0–1 (length +50%, image +25%, document +20%, tools +10%, analytical wording +15%). `score < 0.34` → **fast** tier, `< 0.67` → **balanced**, else **smart**. Cheapest capable endpoint within the target tier; upgrades a tier when empty — never downgrades a hard question to a toy model. |
+| `cheapest` | Estimated cost = input chars/4 × input price + fixed output estimate × output price; lowest wins among capable endpoints. |
+| `balanced` | Round-robin by today's call count across affordable endpoints — spreads load evenly. |
+| `failover` | Strict `priority` order; first healthy endpoint answers. |
+
+Every candidate is filtered before selection:
+
+- ❌ disabled, or quarantined by the **circuit breaker** (3 consecutive failures
+  → 5-minute cooldown; auth errors quarantine ~30 min)
+- ❌ image attached but endpoint has `supports_vision=False`
+- ❌ query larger than `max_input_chars`
+- ❌ today's spend ≥ `daily_budget_usd`
+
+If a chosen provider throws mid-reply, the router **fails over** to the next
+candidate transparently; only when *all* candidates fail does the user see an
+error. During multi-step tool calls the first successful endpoint is pinned so
+one conversation stays on one model.
+
+Token usage is parsed from every provider's response and persisted to
+`.wa_data/provider_usage.json`:
+
+```python
+>>> agent.usage_summary()
+{'today': {'groq-fast': {'calls': 23, 'input_tokens': 4120, 'output_tokens': 1890,
+                         'cost_usd': 0.0039, 'budget_remaining': None},
+           'gpt4o':    {'calls': 4, 'input_tokens': 18400, 'output_tokens': 2100,
+                        'cost_usd': 0.067, 'budget_remaining': 4.933}},
+ 'lifetime': {...}}
+```
+
+Notes:
+- Endpoints with unknown pricing (`price_*_per_m=0`) are treated as free — put
+  local Ollama there and it will absorb all simple traffic.
+- Route-level overrides ([§9.4](#94-multi-persona-router-support--sales--vip))
+  bypass the router entirely — a route that *must* use Claude still can.
+- The agent-level `llm=` remains the fallback used when no router is attached.
+
 ## Configuration reference
 
 ```python
 WhatsAppAgent(llm=..., **overrides)   # overrides = AgentConfig fields
 ```
+
+| field | default | meaning |
+|---|---|---|
+| `provider_router` | `None` | attach a `ProviderRouter` for multi-API smart routing (see above) |
 
 **Behaviour**
 
@@ -463,6 +544,7 @@ agent.scheduler.every / .remind_after / .at / .cancel_all / .active
 agent.send_campaign(jids, text, min_delay=, max_delay=) -> dict
 agent.memory.history(jid) / .clear(jid) / .clear_all()
 agent.safety.stats() / .set_blocked(jid, True|False) / .is_blocked(jid)
+agent.usage_summary()                  # per-endpoint tokens/cost/budget report
 
 # outbound (usable anywhere after start)
 await agent.send_text(jid, text) -> SentReceipt
@@ -487,6 +569,7 @@ bare numbers are accepted wherever a JID goes through helpers like
 | `.wa_sessions/logs/bridge-*.log` | Node bridge stdout/stderr |
 | `.wa_data/safety.json` | rate-limit counters |
 | `.wa_data/optouts.json` | STOP list |
+| `.wa_data/provider_usage.json` | Provider Router token/cost accounting |
 | `.wa_data/notes.json` | builtin notes tool storage |
 
 Logging: `logging.getLogger("wa_agent")` (children `.bridge`, `.safety`,
