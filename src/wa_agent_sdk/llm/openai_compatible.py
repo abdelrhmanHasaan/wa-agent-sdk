@@ -140,4 +140,6 @@ class OpenAICompatibleProvider(BaseChatProvider):
             text=message.get("content") or "",
             tool_calls=tool_calls,
             finish_reason=str(choices[0].get("finish_reason") or ""),
+            input_tokens=int((data.get("usage") or {}).get("prompt_tokens") or 0),
+            output_tokens=int((data.get("usage") or {}).get("completion_tokens") or 0),
         )

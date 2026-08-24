@@ -52,6 +52,8 @@ class ChatResult:
     text: str = ""
     tool_calls: list[ToolCall] = field(default_factory=list)
     finish_reason: str = ""
+    input_tokens: int = 0
+    output_tokens: int = 0
 
     @property
     def has_tool_calls(self) -> bool:

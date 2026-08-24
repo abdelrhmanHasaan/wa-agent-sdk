@@ -143,8 +143,11 @@ class GeminiProvider(BaseChatProvider):
                     )
                 )
 
+        usage_meta = data.get("usageMetadata") or {}
         return ChatResult(
             text="".join(text_chunks),
             tool_calls=tool_calls,
             finish_reason=str(candidates[0].get("finishReason") or ""),
+            input_tokens=int(usage_meta.get("promptTokenCount") or 0),
+            output_tokens=int(usage_meta.get("candidatesTokenCount") or 0),
         )

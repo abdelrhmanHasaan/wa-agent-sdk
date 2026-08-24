@@ -109,6 +109,10 @@ class WhatsAppAgent:
         self.scheduler = Scheduler(self.send_text)
         self._provider: BaseChatProvider | None = None
         self._extra_providers: dict[str, BaseChatProvider] = {}
+        self._prouter = config.provider_router
+        if self._prouter is not None:
+            self._prouter.attach_storage(config.resolved_data_dir())
+        self._last_endpoint_name: str | None = None
         self._bridge: BaileysBridge | None = None
         self._ready = asyncio.Event()
         self._stop_event = asyncio.Event()
@@ -220,7 +224,13 @@ class WhatsAppAgent:
             if provider is not None:
                 await provider.aclose()
         self._extra_providers.clear()
+        if self._prouter is not None:
+            await self._prouter.aclose()
         self._ready.clear()
+
+    def usage_summary(self) -> dict[str, Any] | None:
+        """Token/cost report per routed endpoint (None without a router)."""
+        return self._prouter.usage_summary() if self._prouter is not None else None
 
     async def __aenter__(self) -> "WhatsAppAgent":
         await self.start()
@@ -484,10 +494,19 @@ class WhatsAppAgent:
                 return
 
         route = self.router.resolve(message)
-        try:
-            user_msg = await self._build_user_message(message, provider=self._provider_for(
+        use_router = self._prouter is not None and not (route and route.llm)
+        if use_router:
+            vision_ok = self._prouter.any_supports_vision()
+            provider_for_media = None
+        else:
+            provider_for_media = self._provider_for(
                 route.llm if route and route.llm else self.config.llm
-            ))
+            )
+            vision_ok = getattr(provider_for_media, "supports_vision", True)
+        try:
+            user_msg = await self._build_user_message(
+                message, provider=provider_for_media, vision_ok=vision_ok
+            )
         except (MediaError, UnsupportedDocumentError) as exc:
             await self.send_text(message.chat_jid, f"⚠️ Could not process your attachment: {exc}")
             return
@@ -521,16 +540,21 @@ class WhatsAppAgent:
             await self.send_text(message.chat_jid, reply_text)
 
     async def _build_user_message(
-        self, message: IncomingMessage, *, provider: BaseChatProvider | None = None
+        self,
+        message: IncomingMessage,
+        *,
+        provider: BaseChatProvider | None = None,
+        vision_ok: bool | None = None,
     ) -> ChatMessage | None:
         cfg = self.config
+        if vision_ok is None:
+            vision_ok = getattr(provider, "supports_vision", True) if provider else True
         blocks: list[dict[str, Any]] = []
         caption = (message.caption or "").strip()
         body = (message.text or "").strip()
 
         if message.has_media and message.media_type == MediaType.IMAGE:
-            if cfg.handle_images and self._bridge is not None and provider is not None \
-                    and getattr(provider, "supports_vision", True):
+            if cfg.handle_images and self._bridge is not None and vision_ok:
                 raw_b64, _mime = await self._bridge.download_media(message.id)
                 img_b64, img_mime = prepare_image(base64.b64decode(raw_b64), max_side=cfg.max_image_side_px)
                 blocks.append(image_block(img_mime, img_b64))
@@ -614,10 +638,29 @@ class WhatsAppAgent:
         return merged, merged.schemas()
 
     async def _generate(self, chat_jid: str, route: Any = None) -> str:
-        provider = self._provider_for(route.llm if route and route.llm else self.config.llm)
-
         registry, schemas = self._tools_for(route)
-        supports_tools = bool(len(registry)) and getattr(provider, "supports_tools", True)
+        use_router = self._prouter is not None and not (route and route.llm)
+
+        if use_router:
+            state = {"endpoint": None}
+
+            async def do_chat(messages, tools_list):
+                result, endpoint = await self._prouter.chat(
+                    messages, tools_list, pinned=state["endpoint"]
+                )
+                state["endpoint"] = endpoint.name
+                self._last_endpoint_name = endpoint.name
+                return result
+
+            effective_schemas = schemas if schemas else None
+        else:
+            provider = self._provider_for(route.llm if route and route.llm else self.config.llm)
+            supports_tools = bool(len(registry)) and getattr(provider, "supports_tools", True)
+            effective_schemas = schemas if supports_tools else None
+
+            async def do_chat(messages, tools_list):
+                return await provider.chat(messages, tools=effective_schemas)
+
         conversation = [
             ChatMessage(role="system", content=self._system_prompt(
                 route.system_prompt if route else None
@@ -627,7 +670,7 @@ class WhatsAppAgent:
 
         result_text = ""
         for _iteration in range(max(1, self.config.max_tool_iterations)):
-            result = await provider.chat(conversation, tools=schemas if supports_tools else None)
+            result = await do_chat(conversation, effective_schemas)
             if not result.has_tool_calls:
                 result_text = result.text
                 break

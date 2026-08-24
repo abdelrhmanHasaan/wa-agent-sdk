@@ -125,12 +125,14 @@ class AnthropicProvider(BaseChatProvider):
                     )
                 )
 
+        usage = data.get("usage") or {}
         result = ChatResult(
             text="".join(text_parts),
             tool_calls=tool_calls,
             finish_reason=str(data.get("stop_reason") or ""),
+            input_tokens=int(usage.get("input_tokens") or 0),
+            output_tokens=int(usage.get("output_tokens") or 0),
         )
-        usage = data.get("usage") or {}
         if usage.get("is_error"):
             raise ProviderError(f"{self.name}: error response: {str(data)[:400]}")
         return result

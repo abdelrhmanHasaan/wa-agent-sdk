@@ -5,8 +5,9 @@ from __future__ import annotations
 import dataclasses
 import difflib
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 from .exceptions import ProviderAuthError, WaAgentError
 
@@ -111,6 +112,8 @@ class AgentConfig:
     session_name: str = "default"
     sessions_dir: Path | None = None
     data_dir: Path | None = None
+
+    provider_router: Any = None
 
     max_history_messages: int = 40
     max_context_chars: int = 60_000

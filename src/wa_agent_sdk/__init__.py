@@ -32,6 +32,15 @@ from .llm.factory import create_provider, register_provider
 from .memory import ConversationMemory
 from .models import IncomingMessage, MediaType, SentReceipt
 from .router import AgentRouter, Route, TriggerBoard
+from .routing import (
+    ModelEndpoint,
+    ProviderRouter,
+    QueryProfile,
+    Strategy,
+    Tier,
+    UsageTracker,
+    profile_query,
+)
 from .safety import SafetyManager
 from .scheduler import CampaignReport, Job, Scheduler
 from .tools import Tool, ToolRegistry, parse_document, prepare_image, tool
@@ -62,6 +71,13 @@ __all__ = [
     "AgentRouter",
     "Route",
     "TriggerBoard",
+    "ProviderRouter",
+    "ModelEndpoint",
+    "Strategy",
+    "Tier",
+    "QueryProfile",
+    "profile_query",
+    "UsageTracker",
     "SafetyManager",
     "Scheduler",
     "Job",

@@ -1,5 +1,6 @@
 """LLM provider tests using httpx.MockTransport — no network needed."""
 
+import asyncio
 import json
 
 import httpx
@@ -44,7 +45,8 @@ def test_openai_multimodal_and_tool_calls():
                     }],
                 },
                 "finish_reason": "tool_calls",
-            }]
+            }],
+            "usage": {"prompt_tokens": 11, "completion_tokens": 4},
         })
 
     prov = OpenAICompatibleProvider(LLMConfig(provider="openai", model="gpt-4o-mini", api_key="sk-test"))
@@ -55,6 +57,7 @@ def test_openai_multimodal_and_tool_calls():
     ]
     res = prov.chat and __import__("asyncio").run(prov.chat(msgs, tools=TOOLS_SCHEMA))
     assert res.has_tool_calls and res.tool_calls[0].args == {"expression": "6*7"}
+    assert res.input_tokens > 0
     assert captured["auth"] == "Bearer sk-test"
     part = captured["body"]["messages"][1]["content"][1]
     assert part["image_url"]["url"].startswith("data:image/jpeg;base64,QUJD")
@@ -73,7 +76,7 @@ def test_anthropic_conversion_roundtrip():
                 {"type": "tool_use", "id": "tu_9", "name": "calc", "input": {"x": 1}},
             ],
             "stop_reason": "tool_use",
-            "usage": {},
+            "usage": {"input_tokens": 14, "output_tokens": 6},
         })
 
     prov = AnthropicProvider(LLMConfig(provider="anthropic", model="claude-sonnet-4-5", api_key="sk-ant"))
@@ -85,6 +88,7 @@ def test_anthropic_conversion_roundtrip():
         ChatMessage(role="tool", tool_call_id="tu_x", name="calc", content="42"),
     ], tools=TOOLS_SCHEMA))
     assert res.text == "The answer is" and res.tool_calls[0].name == "calc"
+    assert (res.input_tokens, res.output_tokens) == (14, 6)
 
 
 def test_gemini_function_response_shape():
@@ -98,16 +102,18 @@ def test_gemini_function_response_shape():
                 {"text": "calc!"},
                 {"functionCall": {"name": "calc", "args": {"x": 2}}},
             ]}, "finishReason": "STOP"}],
+            "usageMetadata": {"promptTokenCount": 13, "candidatesTokenCount": 8},
         })
 
     prov = GeminiProvider(LLMConfig(provider="gemini", model="gemini-2.0-flash", api_key="g-key"))
     prov._client = mock_client(handler)
-    res = __import__("asyncio").run(prov.chat([
+    res = asyncio.run(prov.chat([
         ChatMessage(role="system", content="sys"),
         ChatMessage(role="assistant", content="", tool_calls=[ToolCall(id="i", name="calc", args={"x": 1})]),
         ChatMessage(role="tool", tool_call_id="i", name="calc", content="42"),
     ], tools=TOOLS_SCHEMA))
     assert res.text == "calc!" and res.tool_calls[0].args == {"x": 2}
+    assert (res.input_tokens, res.output_tokens) == (13, 8)
 
 
 def test_agent_tool_loop_executes_builtin_calculator():
