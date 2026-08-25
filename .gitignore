@@ -13,6 +13,8 @@ venv/
 *.log
 
 my_whatsapp_agent.py
+MY_ARCHITECTURE_GUIDE.md
+INTERVIEW_GUIDE.md
 .env
 
 node_modules/
